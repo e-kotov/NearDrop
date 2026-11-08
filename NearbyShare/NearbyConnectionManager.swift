@@ -186,6 +186,7 @@ public protocol ShareExtensionDelegate:AnyObject{
 public class NearbyConnectionManager : NSObject, NetServiceDelegate, InboundNearbyConnectionDelegate, OutboundNearbyConnectionDelegate{
 	
 	private var tcpListener:NWListener;
+	private let serviceFilter:(NWBrowser.Result)->Bool
 	public let endpointID:[UInt8]=generateEndpointID()
 	private var mdnsService:NetService?
 	private var activeConnections:[String:InboundNearbyConnection]=[:]
@@ -202,10 +203,14 @@ public class NearbyConnectionManager : NSObject, NetServiceDelegate, InboundNear
 	private var qrCodeAdvertisingToken:Data?
 	private var qrCodeNameEncryptionKey:SymmetricKey?
 	private var qrCodeData:Data?
+	private var qrCodeTransferStarted=false
 	
 	public static let shared=NearbyConnectionManager()
 	
-	override init() {
+	init(serviceFilter:@escaping (NWBrowser.Result)->Bool = {service in
+		!service.interfaces.contains(where: {$0.type == .loopback})
+	}) {
+		self.serviceFilter=serviceFilter
 		tcpListener=try! NWListener(using: NWParameters(tls: .none))
 		super.init()
 	}
@@ -284,6 +289,9 @@ public class NearbyConnectionManager : NSObject, NetServiceDelegate, InboundNear
 						switch change{
 						case let .added(res):
 							self.maybeAddFoundDevice(service: res)
+						case let .changed(_, res, _):
+							// Android updates its existing TXT record after scanning the QR code.
+							self.maybeAddFoundDevice(service: res)
 						case let .removed(res):
 							self.maybeRemoveFoundDevice(service: res)
 						default:
@@ -339,13 +347,11 @@ public class NearbyConnectionManager : NSObject, NetServiceDelegate, InboundNear
 		#if DEBUG
 		print("found service \(service)")
 		#endif
-		for interface in service.interfaces{
-			if case .loopback=interface.type{
-				#if DEBUG
-				print("ignoring localhost service")
-				#endif
-				return
-			}
+		if !serviceFilter(service){
+			#if DEBUG
+			print("ignoring localhost service")
+			#endif
+			return
 		}
 		guard let endpointID=endpointID(for: service) else {return}
 		#if DEBUG
@@ -358,36 +364,37 @@ public class NearbyConnectionManager : NSObject, NetServiceDelegate, InboundNear
 		guard let endpointInfoSerialized=Data.dataFromUrlSafeBase64(endpointInfoEncoded) else {return}
 		guard var endpointInfo=EndpointInfo(data: endpointInfoSerialized) else {return}
 		
-		var deviceInfo:RemoteDeviceInfo?
-		if let _=endpointInfo.name{
-			deviceInfo=addFoundDevice(foundService: &foundService, endpointInfo: endpointInfo, endpointID: endpointID)
-		}
-		
+		var matchesQrCode=false
 		if let qrData=endpointInfo.qrCodeData, let _=qrCodeAdvertisingToken{
 #if DEBUG
 			print("Device has QR data: \(qrData.base64EncodedString()), our advertising token is \(qrCodeAdvertisingToken!.base64EncodedString())")
 #endif
 			if qrData==qrCodeAdvertisingToken!{
-				if let deviceInfo=deviceInfo{
-					for delegate in shareExtensionDelegates{
-						delegate.startTransferWithQrCode(device: deviceInfo)
-					}
-				}
+				matchesQrCode=true
 			}else if qrData.count>28{
 				do{
 					let box=try AES.GCM.SealedBox(combined: qrData)
 					let decryptedName=try AES.GCM.open(box, using: qrCodeNameEncryptionKey!, authenticating: qrCodeAdvertisingToken!)
 					guard let name=String.init(data: decryptedName, encoding: .utf8) else {return}
 					endpointInfo.name=name
-					let deviceInfo=addFoundDevice(foundService: &foundService, endpointInfo: endpointInfo, endpointID: endpointID)
-					for delegate in shareExtensionDelegates{
-						delegate.startTransferWithQrCode(device: deviceInfo)
-					}
+					matchesQrCode=true
 				}catch{
 #if DEBUG
 					print("Error decrypting QR code data of an invisible device: \(error)")
 #endif
 				}
+			}
+		}
+		guard endpointInfo.name != nil else {
+			maybeRemoveFoundDevice(service: service)
+			return
+		}
+		let deviceInfo=addFoundDevice(foundService: &foundService, endpointInfo: endpointInfo, endpointID: endpointID)
+		if matchesQrCode && !qrCodeTransferStarted{
+			// Further TXT/interface changes must not start this QR session twice.
+			qrCodeTransferStarted=true
+			for delegate in shareExtensionDelegates{
+				delegate.startTransferWithQrCode(device: deviceInfo)
 			}
 		}
 	}
@@ -411,6 +418,7 @@ public class NearbyConnectionManager : NSObject, NetServiceDelegate, InboundNear
 	}
 	
 	public func generateQrCodeKey() -> String{
+		qrCodeTransferStarted=false
 		let domain=Domain.instance(curve: .EC256r1)
 		let (pubKey, privKey)=domain.makeKeyPair()
 		qrCodePublicKey=pubKey
@@ -430,6 +438,7 @@ public class NearbyConnectionManager : NSObject, NetServiceDelegate, InboundNear
 	}
 	
 	public func clearQrCodeKey(){
+		qrCodeTransferStarted=false
 		qrCodePublicKey=nil
 		qrCodePrivateKey=nil
 		qrCodeAdvertisingToken=nil

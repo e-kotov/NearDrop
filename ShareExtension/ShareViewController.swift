@@ -195,6 +195,12 @@ class ShareViewController: NSViewController, ShareExtensionDelegate{
 	}
 	
 	func addDevice(device: RemoteDeviceInfo) {
+		guard chosenDevice==nil else {return}
+		if let index=foundDevices.firstIndex(where: {$0.id==device.id}){
+			foundDevices[index]=device
+			listView?.reloadItems(at: [[0, index]])
+			return
+		}
 		if foundDevices.isEmpty{
 			loadingOverlay?.animator().isHidden=true
 		}
@@ -219,6 +225,7 @@ class ShareViewController: NSViewController, ShareExtensionDelegate{
 	}
 	
 	func startTransferWithQrCode(device: RemoteDeviceInfo){
+		guard chosenDevice==nil, sheetWindow != nil else {return}
 		dismissQrCodeSheet(nil)
 		selectDevice(device: device)
 	}
@@ -272,6 +279,7 @@ class ShareViewController: NSViewController, ShareExtensionDelegate{
 	}
 	
 	func selectDevice(device:RemoteDeviceInfo){
+		guard chosenDevice==nil else {return}
 		NearbyConnectionManager.shared.stopDeviceDiscovery()
 		listViewWrapper?.animator().isHidden=true
 		progressView?.animator().isHidden=false
